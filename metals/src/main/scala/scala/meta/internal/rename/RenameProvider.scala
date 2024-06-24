@@ -9,6 +9,7 @@ import scala.meta.Importee
 import scala.meta.Tree
 import scala.meta.internal.async.ConcurrentQueue
 import scala.meta.internal.implementation.ImplementationProvider
+import scala.meta.internal.metals.AdjustRange
 import scala.meta.internal.metals.Buffers
 import scala.meta.internal.metals.ClientConfiguration
 import scala.meta.internal.metals.Compilations
@@ -129,9 +130,9 @@ final class RenameProvider(
       )
       .recoverWith { case _ =>
         compilations.compilationFinished(source).flatMap { _ =>
-          val defininionFuture = definitionProvider
+          val definitionFuture = definitionProvider
             .definition(source, params, token)
-          defininionFuture
+          definitionFuture
             .flatMap { definition =>
               val textParams = new TextDocumentPositionParams(
                 params.getTextDocument(),
@@ -215,10 +216,10 @@ final class RenameProvider(
                           txtParams,
                           includeDeclaration = isJava,
                         ),
-                        findRealRange = findRealRange(newName),
+                        findRealRange = AdjustRange(findRealRange(newName)),
                         includeSynthetic,
                       )
-                      .flatMap(_.locations)
+                      .map(_.flatMap(_.locations))
                   definitionLocation = {
                     if (parentSymbols.isEmpty)
                       definition.locations.asScala
@@ -239,9 +240,13 @@ final class RenameProvider(
                     ),
                     newName,
                   )
-                } yield implReferences.map(implLocs =>
-                  currentReferences ++ implLocs ++ companionRefs ++ definitionLocation
-                )
+                } yield Future
+                  .sequence(
+                    List(implReferences, currentReferences, companionRefs)
+                  )
+                  .map(
+                    _.flatten ++ definitionLocation
+                  )
               Future
                 .sequence(allReferences)
                 .map(locs =>
@@ -399,7 +404,7 @@ final class RenameProvider(
       sym: String,
       source: AbsolutePath,
       newName: String,
-  ): Seq[Location] = {
+  ): Future[Seq[Location]] = {
     val results = for {
       companionSymbol <- companion(sym).toIterable
       loc <-
@@ -408,15 +413,15 @@ final class RenameProvider(
           .asScala
       // no companion objects in Java files
       if loc.getUri().isScalaFilename
-      companionLocs <-
-        referenceProvider
-          .references(
-            toReferenceParams(loc, includeDeclaration = false),
-            findRealRange = findRealRange(newName),
-          )
-          .flatMap(_.locations) :+ loc
-    } yield companionLocs
-    results.toList
+    } yield {
+      referenceProvider
+        .references(
+          toReferenceParams(loc, includeDeclaration = false),
+          findRealRange = AdjustRange(findRealRange(newName)),
+        )
+        .map(_.flatMap(_.locations :+ loc))
+    }
+    Future.sequence(results).map(_.flatten.toSeq)
   }
 
   private def companion(sym: String) = {
@@ -459,20 +464,22 @@ final class RenameProvider(
     if (shouldCheckImplementation) {
       for {
         implLocs <- implementationProvider.implementations(textParams)
-      } yield {
-        for {
-          implLoc <- implLocs
-          locParams = toReferenceParams(implLoc, includeDeclaration = true)
-          loc <-
+        result <- {
+          val result = for {
+            implLoc <- implLocs
+            locParams = toReferenceParams(implLoc, includeDeclaration = true)
+          } yield {
             referenceProvider
               .references(
                 locParams,
-                findRealRange = findRealRange(newName),
+                findRealRange = AdjustRange(findRealRange(newName)),
                 includeSynthetic,
               )
-              .flatMap(_.locations)
-        } yield loc
-      }
+              .map(_.flatMap(_.locations))
+          }
+          Future.sequence(result)
+        }
+      } yield result.flatten
     } else {
       Future.successful(Nil)
     }
@@ -572,20 +579,29 @@ final class RenameProvider(
       symbol: String,
   ): Option[s.Range] = {
     val name = range.inString(text)
-    val nameString = symbol.desc.name.toString()
+    lazy val nameString = symbol.desc.name.toString()
     val isExplicitVarSetter =
       name.exists(nm => nm.endsWith("_=") || nm.endsWith("_=`"))
     val isBackticked = name.exists(_.isBackticked)
 
-    val symbolName =
+    lazy val symbolName =
       if (!isExplicitVarSetter) nameString.stripSuffix("_=")
       else nameString
-    val realName =
+
+    lazy val realName =
       if (isBackticked)
         name.map(_.stripBackticks)
       else name
 
-    if (symbol.isLocal || realName.contains(symbolName)) {
+    lazy val alternativeName =
+      if (symbolName == "apply" || symbolName == "unapply")
+        Some(symbol.owner).filter(_ != Symbols.None).map(_.desc.name.toString())
+      else None
+
+    if (
+      symbol.isLocal || realName
+        .contains(symbolName) || alternativeName.exists(realName.contains)
+    ) {
       /* We don't want to remove anything that is backticked, as we don't
        * know whether it's actuall needed (could be a pattern match). Here
        * we make sure that the backticks are not added twice.

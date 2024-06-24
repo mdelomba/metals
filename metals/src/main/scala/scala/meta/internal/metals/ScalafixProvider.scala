@@ -49,7 +49,7 @@ case class ScalafixProvider(
     interactive: InteractiveSemanticdbs,
     tables: Tables,
     buildHasErrors: AbsolutePath => Boolean,
-)(implicit ec: ExecutionContext) {
+)(implicit ec: ExecutionContext, rc: ReportContext) {
   import ScalafixProvider._
   private val scalafixCache = TrieMap.empty[ScalaBinaryVersion, Scalafix]
   private val rulesClassloaderCache =
@@ -189,11 +189,11 @@ case class ScalafixProvider(
 
   /**
    * Scalafix may be ran successfully, but that doesn't mean that every file
-   * evaluation also ran succesfully. This ensure that the scalafix run was successful
+   * evaluation also ran successfully. This ensure that the scalafix run was successful
    * and also that every file evaluation was successful.
    *
    * @param evaluation
-   * @return true only if the evaulation for every single file contains no errors
+   * @return true only if the evaluation for every single file contains no errors
    */
   private def scalafixSucceded(evaluation: ScalafixEvaluation): Boolean =
     evaluation.isSuccessful && evaluation
@@ -329,6 +329,7 @@ case class ScalafixProvider(
       produceSemanticdb: Boolean,
       rules: List[String],
       suggestConfigAmend: Boolean = true,
+      shouldRetry: Boolean = true,
   ): Future[ScalafixEvaluation] = {
     val isScala3 = ScalaVersions.isScala3Version(scalaTarget.scalaVersion)
     val isSource3 = scalaTarget.scalac.getOptions().contains("-Xsource:3")
@@ -399,7 +400,7 @@ case class ScalafixProvider(
         list
       }
 
-      for {
+      val evalFuture = for {
         classpath <- lazyClasspath
         confFile <- getScalafixConf(
           isSource3,
@@ -420,9 +421,52 @@ case class ScalafixProvider(
           .withScalacOptions(scalacOptions)
           .evaluate()
 
-        if (produceSemanticdb)
-          targetRoot.foreach(AbsolutePath(_).deleteRecursively())
+        if (produceSemanticdb) {
+          // Clean up created file and semanticdbs from `.metals/.tmp` directory
+          targetRoot.foreach { root =>
+            if (diskFilePath.toNIO.startsWith(root))
+              diskFilePath.deleteWithEmptyParents()
+            AbsolutePath(root.resolve("META-INF")).deleteRecursively()
+          }
+        }
         evaluated
+      }
+      evalFuture.recoverWith {
+        case serviceError: java.util.ServiceConfigurationError =>
+          scribe.error(
+            "Scalafix classloading error, retrying with new classloader",
+            serviceError,
+          )
+          val classpath =
+            urlClassLoaderWithExternalRule.getURLs().mkString("\n")
+          val report =
+            Report(
+              "scalafix-classloading-error",
+              s"""|Could not load scalafix rules.
+                  |
+                  |classpath:
+                  |${classpath}
+                  |
+                  |file: $file
+                  |
+                  |scalaVersion: ${scalaTarget.scalaVersion}
+                  |
+                  |""".stripMargin,
+              serviceError,
+            )
+          rc.incognito.create(report)
+          if (shouldRetry) {
+            rulesClassloaderCache.remove(scalafixRulesKey)
+            scalafixEvaluate(
+              file,
+              scalaTarget,
+              inBuffers,
+              produceSemanticdb,
+              rules,
+              suggestConfigAmend,
+              shouldRetry = false,
+            )
+          } else Future.failed(serviceError)
       }
     }
     result.flatten
@@ -524,19 +568,18 @@ case class ScalafixProvider(
 
   private def getScalafix(
       scalaBinaryVersion: ScalaBinaryVersion
-  ): Future[Scalafix] = {
-    scalafixCache.get(scalaBinaryVersion) match {
-      case Some(value) => Future.successful(value)
-      case None =>
+  ): Future[Scalafix] = Future {
+    scalafixCache.getOrElseUpdate(
+      scalaBinaryVersion, {
         workDoneProgress.trackBlocking("Downloading scalafix") {
           val scalafix =
-            if (scalaBinaryVersion == "2.11") Future(scala211Fallback)
+            if (scalaBinaryVersion == "2.11") scala211Fallback
             else
-              Future(Scalafix.fetchAndClassloadInstance(scalaBinaryVersion))
-          scalafix.foreach(api => scalafixCache.update(scalaBinaryVersion, api))
+              Scalafix.fetchAndClassloadInstance(scalaBinaryVersion)
           scalafix
         }
-    }
+      },
+    )
 
   }
 
@@ -559,10 +602,9 @@ case class ScalafixProvider(
   private def getRuleClassLoader(
       scalfixRulesKey: ScalafixRulesClasspathKey,
       scalafixClassLoader: ClassLoader,
-  ): Future[URLClassLoader] = {
-    rulesClassloaderCache.get(scalfixRulesKey) match {
-      case Some(value) => Future.successful(value)
-      case None =>
+  ): Future[URLClassLoader] = Future {
+    rulesClassloaderCache.getOrElseUpdate(
+      scalfixRulesKey, {
         workDoneProgress.trackBlocking(
           "Downloading scalafix rules' dependencies"
         ) {
@@ -579,22 +621,18 @@ case class ScalafixProvider(
               )
             else None
 
-          val allRules =
-            Future(
-              Embedded.rulesClasspath(
-                rulesDependencies.toList ++ organizeImportRule
-              )
-            ).map { paths =>
-              val classloader = Embedded.toClassLoader(
-                Classpath(paths.map(AbsolutePath(_))),
-                scalafixClassLoader,
-              )
-              rulesClassloaderCache.update(scalfixRulesKey, classloader)
-              classloader
-            }
-          allRules
+          val paths =
+            Embedded.rulesClasspath(
+              rulesDependencies.toList ++ organizeImportRule
+            )
+          val classloader = Embedded.toClassLoader(
+            Classpath(paths.map(AbsolutePath(_))),
+            scalafixClassLoader,
+          )
+          classloader
         }
-    }
+      },
+    )
   }
 
   private def isUnsaved(fromBuffers: String, fromFile: String): Boolean = {

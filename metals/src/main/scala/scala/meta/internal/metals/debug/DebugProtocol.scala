@@ -2,6 +2,7 @@ package scala.meta.internal.metals.debug
 
 import scala.reflect.ClassTag
 import scala.util.Failure
+import scala.util.Success
 import scala.util.Try
 
 import scala.meta.internal.metals.MetalsEnrichments._
@@ -11,7 +12,6 @@ import com.google.gson.JsonElement
 import org.eclipse.lsp4j.debug.CompletionsArguments
 import org.eclipse.lsp4j.debug.DisconnectArguments
 import org.eclipse.lsp4j.debug.InitializeRequestArguments
-import org.eclipse.lsp4j.debug.LaunchRequestArguments
 import org.eclipse.lsp4j.debug.OutputEventArguments
 import org.eclipse.lsp4j.debug.SetBreakpointsArguments
 import org.eclipse.lsp4j.debug.SetBreakpointsResponse
@@ -136,11 +136,16 @@ object DebugProtocol {
   object LaunchRequest {
     def unapply(request: DebugRequestMessage): Option[DebugMode] = {
       if (request.getMethod != "launch") None
-      else
-        parse[LaunchRequestArguments](request.getParams).toOption.map {
-          case args if args.getNoDebug => DebugMode.Disabled
-          case _ => DebugMode.Enabled
-        }
+      else {
+        parse[java.util.Map[String, Object]](request.getParams).toOption
+          .map { map =>
+            map.asScala.get("noDebug") match {
+              case Some(value: java.lang.Boolean) if value => DebugMode.Disabled
+              case Some(value: java.lang.Boolean) if !value => DebugMode.Enabled
+              case _ => DebugMode.Enabled
+            }
+          }
+      }
     }
   }
 
@@ -221,6 +226,7 @@ object DebugProtocol {
 
   def parse[A: ClassTag](params: Any): Try[A] = {
     params match {
+      case a: A => Success(a)
       case json: JsonElement =>
         json.as[A]
       case _ =>

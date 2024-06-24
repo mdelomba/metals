@@ -9,7 +9,7 @@ Global / onChangedBuildSource := ReloadOnSourceChanges
 Global / resolvers += "scala-integration" at
   "https://scala-ci.typesafe.com/artifactory/scala-integration/"
 
-def localSnapshotVersion = "1.3.2-SNAPSHOT"
+def localSnapshotVersion = "1.3.3-SNAPSHOT"
 def isCI = System.getenv("CI") != null
 
 def isScala211(v: Option[(Long, Long)]): Boolean = v.contains((2, 11))
@@ -260,7 +260,8 @@ lazy val mtagsShared = project
     },
     libraryDependencies ++= List(
       "org.lz4" % "lz4-java" % "1.8.0",
-      "com.google.protobuf" % "protobuf-java" % "4.26.1",
+      "com.google.protobuf" % "protobuf-java" % "4.27.1",
+      V.guava,
       "io.get-coursier" % "interface" % V.coursierInterfaces,
     ),
   )
@@ -372,6 +373,7 @@ lazy val mtags3 = project
     scalaVersion := V.scala3,
     target := (ThisBuild / baseDirectory).value / "mtags" / "target" / "target3",
     publish / skip := true,
+    libraryDependencies += V.guava,
     scalafixConfig := Some(
       (ThisBuild / baseDirectory).value / ".scalafix3.conf"
     ),
@@ -412,7 +414,7 @@ lazy val metals = project
       "com.swoval" % "file-tree-views" % "2.1.12",
       // for http client
       "io.undertow" % "undertow-core" % "2.2.20.Final",
-      "org.jboss.xnio" % "xnio-nio" % "3.8.14.Final",
+      "org.jboss.xnio" % "xnio-nio" % "3.8.16.Final",
       // for persistent data like "dismissed notification"
       "org.flywaydb" % "flyway-core" % "9.22.3",
       "com.h2database" % "h2" % "2.2.224",
@@ -428,22 +430,67 @@ lazy val metals = project
       "dev.dirs" % "directories" % "26",
       // for Java formatting
       "org.eclipse.jdt" % "org.eclipse.jdt.core" % "3.25.0" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.ant.core" % "3.5.500" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.compare.core" % "3.6.600" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.core.commands" % "3.9.500" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.core.contenttype" % "3.7.500" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.core.expressions" % "3.6.500" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.core.filesystem" % "1.7.500" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.core.jobs" % "3.10.500" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.core.resources" % "3.13.500" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.core.runtime" % "3.16.0" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.core.variables" % "3.4.600" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.equinox.app" % "1.4.300" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.equinox.common" % "3.10.600" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.equinox.preferences" % "3.7.600" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.equinox.registry" % "3.8.600" exclude ("*", "*"),
+      "org.eclipse.platform" % "org.eclipse.ant.core" % "3.5.500" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.compare.core" % "3.6.600" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.core.commands" % "3.9.500" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.core.contenttype" % "3.7.500" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.core.expressions" % "3.6.500" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.core.filesystem" % "1.7.500" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.core.jobs" % "3.10.500" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.core.resources" % "3.13.500" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.core.runtime" % "3.16.0" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.core.variables" % "3.4.600" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.equinox.app" % "1.4.300" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.equinox.common" % "3.10.600" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.equinox.preferences" % "3.7.600" exclude (
+        "*",
+        "*",
+      ),
+      "org.eclipse.platform" % "org.eclipse.equinox.registry" % "3.8.600" exclude (
+        "*",
+        "*",
+      ),
       "org.eclipse.platform" % "org.eclipse.osgi" % "3.15.0" exclude ("*", "*"),
-      "org.eclipse.platform" % "org.eclipse.team.core" % "3.8.700" exclude ("*", "*"),
+      "org.eclipse.platform" % "org.eclipse.team.core" % "3.8.700" exclude (
+        "*",
+        "*",
+      ),
       "org.eclipse.platform" % "org.eclipse.text" % "3.9.0" exclude ("*", "*"),
       // ==================
       // Scala dependencies
@@ -464,7 +511,7 @@ lazy val metals = project
       // for JSON formatted doctor
       "com.lihaoyi" %% "ujson" % "3.3.1",
       // For fetching projects' templates
-      "com.lihaoyi" %% "requests" % "0.8.2",
+      "com.lihaoyi" %% "requests" % "0.8.3",
       // for producing SemanticDB from Scala source files, to be sure we want the same version of scalameta
       "org.scalameta" %% "scalameta" % V.semanticdb(scalaVersion.value),
       "org.scalameta" % "semanticdb-scalac-core" % V.semanticdb(

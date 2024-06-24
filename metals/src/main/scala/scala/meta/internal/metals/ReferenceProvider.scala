@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 
 import scala.collection.concurrent.TrieMap
+import scala.collection.mutable
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.util.control.NonFatal
@@ -40,13 +41,33 @@ final class ReferenceProvider(
     definition: DefinitionProvider,
     trees: Trees,
     buildTargets: BuildTargets,
-) extends SemanticdbFeatureProvider {
+    compilers: Compilers,
+    scalaVersionSelector: ScalaVersionSelector,
+)(implicit ec: ExecutionContext)
+    extends SemanticdbFeatureProvider {
+  val index: TrieMap[Path, IdentifierIndex.MaybeStaleIndexEntry] =
+    TrieMap.empty
+  val identifierIndex: IdentifierIndex = new IdentifierIndex
 
-  case class IndexEntry(
-      id: BuildTargetIdentifier,
-      bloom: BloomFilter[CharSequence],
-  )
-  val index: TrieMap[Path, IndexEntry] = TrieMap.empty
+  def addIdentifiers(file: AbsolutePath, set: Iterable[String]): Unit =
+    buildTargets
+      .inverseSources(file)
+      .map(id => identifierIndex.addIdentifiers(file, id, set))
+
+  def didChange(
+      path: AbsolutePath,
+      text: String,
+  ): Future[Unit] = Future {
+    buildTargets.inverseSources(path).map { id =>
+      val dialect = scalaVersionSelector.getDialect(path)
+      val set = identifierIndex.collectIdentifiers(text, dialect)
+      identifierIndex.addIdentifiers(path, id, set)
+      index.updateWith(path.toNIO) {
+        case Some(entry) if !entry.isStale => Some(entry.asStale)
+        case optEntry => optEntry
+      }
+    }
+  }
 
   override def reset(): Unit = {
     index.clear()
@@ -66,7 +87,8 @@ final class ReferenceProvider(
         0.01,
       )
 
-      val entry = IndexEntry(id, bloom)
+      val entry =
+        IdentifierIndex.MaybeStaleIndexEntry(id, bloom, isStale = false)
       index(file.toNIO) = entry
       docs.documents.foreach { d =>
         d.occurrences.foreach { o =>
@@ -126,16 +148,16 @@ final class ReferenceProvider(
       params: ReferenceParams,
       findRealRange: AdjustRange = noAdjustRange,
       includeSynthetics: Synthetic => Boolean = _ => true,
-  )(implicit report: ReportContext): List[ReferencesResult] = {
+  )(implicit report: ReportContext): Future[List[ReferencesResult]] = {
     val source = params.getTextDocument.getUri.toAbsolutePath
-    semanticdbs().textDocument(source).documentIncludingStale match {
+    semanticdbs().textDocument(source).toOption match {
       case Some(doc) =>
         val results: List[ResolvedSymbolOccurrence] = {
           val posOccurrences =
             definition.positionOccurrences(source, params.getPosition, doc)
           if (posOccurrences.isEmpty)
             // handling case `import a.{A as @@B}`
-            occerencesForRenamedImport(source, params, doc)
+            occurrencesForRenamedImport(source, params, doc)
           else posOccurrences
         }
         if (results.isEmpty) {
@@ -143,55 +165,88 @@ final class ReferenceProvider(
             s"No symbol found at ${params.getPosition()} for $source"
           )
         }
-        results.map { result =>
-          val occurrence = result.occurrence.get
-          val distance = result.distance
-          val alternatives =
-            referenceAlternatives(occurrence.symbol, source, doc)
-          val locations = references(
-            source,
-            params,
-            doc,
-            distance,
-            occurrence,
-            alternatives,
-            params.getContext.isIncludeDeclaration,
-            findRealRange,
-            includeSynthetics,
-          )
-          // It's possible to return nothing is we exclude declaration
-          if (locations.isEmpty && params.getContext().isIncludeDeclaration()) {
-            val fileInIndex =
-              if (index.contains(source.toNIO))
-                s"Current file ${source} is present"
-              else s"Missing current file ${source}"
-            scribe.debug(
-              s"No references found, index size ${index.size}\n" + fileInIndex
-            )
-            report.unsanitized.create(
-              Report(
-                "empty-references",
-                index
-                  .map { case (path, entry) =>
-                    s"$path -> ${entry.bloom.approximateElementCount()}"
-                  }
-                  .mkString("\n"),
-                s"Could not find any locations for ${result.occurrence}, printing index state",
-                Some(source.toString()),
-                Some(source.toString() + ":" + result.occurrence.getOrElse("")),
-              )
-            )
+        val semanticdbResult = Future.sequence {
+          results.map { result =>
+            val occurrence = result.occurrence.get
+            val distance = result.distance
+            val alternatives =
+              referenceAlternatives(occurrence.symbol, source, doc)
+            references(
+              source,
+              params,
+              doc,
+              distance,
+              occurrence,
+              alternatives,
+              params.getContext.isIncludeDeclaration,
+              findRealRange,
+              includeSynthetics,
+            ).map { locations =>
+              // It's possible to return nothing is we exclude declaration
+              if (
+                locations.isEmpty && params.getContext().isIncludeDeclaration()
+              ) {
+                val fileInIndex =
+                  if (index.contains(source.toNIO))
+                    s"Current file ${source} is present"
+                  else s"Missing current file ${source}"
+                scribe.debug(
+                  s"No references found, index size ${index.size}\n" + fileInIndex
+                )
+                report.unsanitized.create(
+                  Report(
+                    "empty-references",
+                    index
+                      .map { case (path, entry) =>
+                        s"$path -> ${entry.bloom.approximateElementCount()}"
+                      }
+                      .mkString("\n"),
+                    s"Could not find any locations for ${result.occurrence}, printing index state",
+                    Some(source.toString()),
+                    Some(
+                      source.toString() + ":" + result.occurrence.getOrElse("")
+                    ),
+                  )
+                )
+              }
+              ReferencesResult(occurrence.symbol, locations)
+            }
           }
-          ReferencesResult(occurrence.symbol, locations)
         }
+        val pcResult =
+          pcReferences(
+            source,
+            results.flatMap(_.occurrence).map(_.symbol),
+            params.getContext().isIncludeDeclaration(),
+            path => !index.get(path.toNIO).exists(!_.isStale),
+            findRealRange,
+          )
+
+        Future
+          .sequence(List(semanticdbResult, pcResult))
+          .map(
+            _.flatten
+              .groupBy(_.symbol)
+              .collect { case (symbol, refs) =>
+                ReferencesResult(symbol, refs.flatMap(_.locations))
+              }
+              .toList
+          )
       case None =>
-        Nil
+        scribe.debug(s"No semanticdb for $source")
+        pcReferences(source, params, findRealRange).map(
+          _.groupBy(_.symbol)
+            .collect { case (symbol, refs) =>
+              ReferencesResult(symbol, refs.flatMap(_.locations))
+            }
+            .toList
+        )
     }
   }
 
-  // for `import package.{AA as B@@B}` we look for occurences at `import package.{@@AA as BB}`,
-  // since rename is not a position occurence in semanticDB
-  private def occerencesForRenamedImport(
+  // for `import package.{AA as B@@B}` we look for occurrences at `import package.{@@AA as BB}`,
+  // since rename is not a position occurrence in semanticDB
+  private def occurrencesForRenamedImport(
       source: AbsolutePath,
       params: ReferenceParams,
       document: TextDocument,
@@ -279,12 +334,99 @@ final class ReferenceProvider(
     }
   }
 
+  private def pcReferences(
+      path: AbsolutePath,
+      params: ReferenceParams,
+      adjustLocation: AdjustRange,
+  ): Future[List[ReferencesResult]] = {
+    compilers.references(params, EmptyCancelToken, adjustLocation).flatMap {
+      foundRefs =>
+        pcReferences(
+          path,
+          foundRefs.map(_.symbol),
+          includeDeclaration = params.getContext().isIncludeDeclaration(),
+          filterTargetFiles = _ != path,
+          adjustLocation,
+        ).map(_ ++ foundRefs)
+    }
+  }
+
+  private def pcReferences(
+      path: AbsolutePath,
+      symbols: List[String],
+      includeDeclaration: Boolean,
+      filterTargetFiles: AbsolutePath => Boolean,
+      adjustLocation: AdjustRange,
+  ): Future[List[ReferencesResult]] = {
+    val visited = mutable.Set[AbsolutePath]()
+    val results = for {
+      buildTarget <- buildTargets.inverseSources(path).toList
+      _ = visited.clear()
+      symbol <- symbols
+      name = nameFromSymbol(symbol)
+      pathsMap = pathsForName(buildTarget, name)
+      id <- pathsMap.keySet
+      searchFiles = pathsMap(id)
+        .filter(searchFile =>
+          filterTargetFiles(searchFile) && !visited(searchFile)
+        )
+        .distinct
+      if searchFiles.nonEmpty
+    } yield {
+      visited ++= searchFiles
+      () =>
+        compilers.references(
+          id,
+          searchFiles,
+          includeDeclaration,
+          symbol,
+          adjustLocation,
+        )
+    }
+    val maxPcsNumber = Runtime.getRuntime().availableProcessors() / 2
+    executeBatched(results, maxPcsNumber).map(_.flatten)
+  }
+
+  private def nameFromSymbol(
+      semanticDBSymbol: String
+  ): String = {
+    val desc = semanticDBSymbol.desc
+    val actualSym =
+      if (
+        desc.isMethod && (desc.name.value == "apply" || desc.name.value == "unapply")
+      ) {
+        val owner = semanticDBSymbol.owner
+        if (owner != s.Scala.Symbols.None) owner.desc
+        else desc
+      } else desc
+    actualSym.name.value
+  }
+
+  private def pathsForName(
+      buildTarget: BuildTargetIdentifier,
+      name: String,
+  ): Map[BuildTargetIdentifier, List[AbsolutePath]] = {
+    val allowedBuildTargets = buildTargets.allInverseDependencies(buildTarget)
+    val visited = scala.collection.mutable.Set.empty[AbsolutePath]
+    val foundPaths = for {
+      (path, entry) <- identifierIndex.index.iterator
+      if allowedBuildTargets.contains(entry.id) &&
+        entry.bloom.mightContain(name)
+      sourcePath = AbsolutePath(path)
+      if !visited(sourcePath)
+      _ = visited.add(sourcePath)
+      if sourcePath.exists
+    } yield (entry.id, sourcePath)
+    foundPaths.toList.groupMap(_._1)(_._2)
+  }
+
   /**
    * Return all paths to files which contain at least one symbol from isSymbol set.
    */
   private def pathsFor(
       buildTargetSet: Set[BuildTargetIdentifier],
       isSymbol: Set[String],
+      includeStale: Boolean,
   ): Iterator[AbsolutePath] = {
     if (buildTargetSet.isEmpty) Iterator.empty
     else {
@@ -293,6 +435,7 @@ final class ReferenceProvider(
       val visited = scala.collection.mutable.Set.empty[AbsolutePath]
       val result = for {
         (path, entry) <- index.iterator
+        if includeStale || !entry.isStale || path.filename.isJavaFilename
         if allowedBuildTargets(entry.id) &&
           isSymbol.exists(entry.bloom.mightContain)
         sourcePath = AbsolutePath(path)
@@ -334,7 +477,11 @@ final class ReferenceProvider(
       }
 
     val result = for {
-      sourcePath <- pathsFor(definitionBuildTargets, isSymbol)
+      sourcePath <- pathsFor(
+        definitionBuildTargets,
+        isSymbol,
+        includeStale = false,
+      )
       semanticdb <-
         semanticdbs()
           .textDocument(sourcePath)
@@ -377,7 +524,9 @@ final class ReferenceProvider(
   )(implicit ec: ExecutionContext): Future[Set[AbsolutePath]] = {
     buildTargets
       .inverseSourcesBspAll(source)
-      .map(buildTargets => pathsFor(buildTargets.toSet, isSymbol).toSet)
+      .map(buildTargets =>
+        pathsFor(buildTargets.toSet, isSymbol, includeStale = true).toSet
+      )
   }
 
   private def references(
@@ -390,40 +539,42 @@ final class ReferenceProvider(
       isIncludeDeclaration: Boolean,
       findRealRange: AdjustRange,
       includeSynthetics: Synthetic => Boolean,
-  ): Seq[Location] = {
+  ): Future[Seq[Location]] = {
     val isSymbol = alternatives + occ.symbol
     val isLocal = occ.symbol.isLocal
+    if (isLocal)
+      compilers
+        .references(params, EmptyCancelToken, findRealRange)
+        .map(_.flatMap(_.locations))
+    else {
+      /* search local in the following cases:
+       * - it's a dependency source.
+       *   We can't search references inside dependencies so at least show them in a source file.
+       * - it's a standalone file that doesn't belong to any build target
+       */
+      val searchLocal =
+        source.isDependencySource(workspace) ||
+          buildTargets.inverseSources(source).isEmpty
 
-    /* search local in the following cases:
-     * - it's local symbol
-     * - it's a dependency source.
-     *   We can't search references inside dependencies so at least show them in a source file.
-     * - it's a standalone file that doesn't belong to any build target
-     */
-    val searchLocal =
-      isLocal || source.isDependencySource(workspace) ||
-        buildTargets.inverseSources(source).isEmpty
-    val local =
-      if (searchLocal)
-        referenceLocations(
-          snapshot,
-          isSymbol,
-          distance,
-          params.getTextDocument.getUri,
-          isIncludeDeclaration,
-          findRealRange,
-          includeSynthetics,
-          source.isJava,
-        )
-      else Seq.empty
-
-    val workspaceRefs =
-      if (!isLocal) {
-        val sourceContainsDefinition =
-          occ.role.isDefinition || snapshot.symbols.exists(
-            _.symbol == occ.symbol
+      val local =
+        if (searchLocal)
+          referenceLocations(
+            snapshot,
+            isSymbol,
+            distance,
+            params.getTextDocument.getUri,
+            isIncludeDeclaration,
+            findRealRange,
+            includeSynthetics,
+            source.isJava,
           )
+        else Seq.empty
 
+      val sourceContainsDefinition =
+        occ.role.isDefinition || snapshot.symbols.exists(
+          _.symbol == occ.symbol
+        )
+      val workspaceRefs =
         workspaceReferences(
           source,
           isSymbol,
@@ -432,11 +583,8 @@ final class ReferenceProvider(
           includeSynthetics,
           sourceContainsDefinition,
         )
-
-      } else
-        Seq.empty
-
-    workspaceRefs ++ local
+      Future.successful(local ++ workspaceRefs)
+    }
   }
 
   private def referenceLocations(
@@ -491,16 +639,9 @@ final class ReferenceProvider(
       range <- synthetic.range.toList
     } add(range)
 
-    buf.result().toSeq.sortWith(sortByLocationPosition)
+    buf.result().toSeq
   }
 
-  private def sortByLocationPosition(l1: Location, l2: Location): Boolean = {
-    l1.getRange.getStart.getLine < l2.getRange.getStart.getLine
-  }
-
-  private val noAdjustRange: AdjustRange =
-    (range: s.Range, _: String, _: String) => Some(range)
-  type AdjustRange = (s.Range, String, String) => Option[s.Range]
 }
 
 class SymbolAlternatives(symbol: String, name: String) {
@@ -617,4 +758,38 @@ object SyntheticPackageObject {
   val regex: Regex = "/.*[$]package[.]".r
   def unapply(str: String): Option[String] =
     Option.when(regex.matches(str))(str)
+}
+
+trait AdjustRange {
+  def apply(range: s.Range, text: String, symbol: String): Option[s.Range]
+  def apply(loc: Location, text: String, symbol: String): Option[Location] = {
+    val semRange = s.Range(
+      loc.getRange().getStart().getLine(),
+      loc.getRange().getStart().getCharacter(),
+      loc.getRange().getEnd().getLine(),
+      loc.getRange().getEnd().getCharacter(),
+    )
+    for (adjusted <- apply(semRange, text, symbol)) yield {
+      loc.setRange(adjusted.toLsp)
+      loc
+    }
+  }
+}
+
+object noAdjustRange extends AdjustRange {
+  def apply(range: s.Range, text: String, symbol: String): Option[s.Range] =
+    Some(range)
+  override def apply(
+      loc: Location,
+      text: String,
+      symbol: String,
+  ): Option[Location] = Some(loc)
+}
+
+object AdjustRange {
+  def apply(adjust: (s.Range, String, String) => Option[s.Range]): AdjustRange =
+    new AdjustRange {
+      def apply(range: s.Range, text: String, symbol: String): Option[s.Range] =
+        adjust(range, text, symbol)
+    }
 }

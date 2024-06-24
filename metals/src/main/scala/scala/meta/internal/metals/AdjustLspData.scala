@@ -3,6 +3,7 @@ package scala.meta.internal.metals
 import java.{util => ju}
 
 import scala.meta.internal.metals.MetalsEnrichments._
+import scala.meta.pc
 import scala.meta.pc.AutoImportsResult
 import scala.meta.pc.HoverSignature
 
@@ -49,6 +50,26 @@ trait AdjustLspData {
     diag.setRange(adjustRange(diag.getRange()))
     diag
   }
+
+  def adjustLocation(location: Location): Location =
+    new Location(location.getUri(), adjustRange(location.getRange()))
+
+  def adjustReferencesResult(
+      referencesResult: pc.ReferencesResult,
+      additionalAdjust: AdjustRange,
+      text: String,
+  ): ReferencesResult =
+    new ReferencesResult(
+      referencesResult.symbol,
+      referencesResult
+        .locations()
+        .asScala
+        .flatMap(loc =>
+          additionalAdjust(loc, text, referencesResult.symbol)
+            .map(adjustLocation)
+        )
+        .toList,
+    )
 
   def adjustLocations(
       locations: java.util.List[Location]

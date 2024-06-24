@@ -47,8 +47,7 @@ class BazelLspSuite
       _ = assertNoDiff(
         client.workspaceMessageRequests,
         List(
-          importMessage,
-          bazelNavigationMessage,
+          importMessage
         ).mkString("\n"),
       )
       _ = assert(bazelBspConfig.exists)
@@ -128,10 +127,7 @@ class BazelLspSuite
            |""".stripMargin,
       )
     } yield {
-      assertNoDiff(
-        client.workspaceMessageRequests,
-        bazelNavigationMessage,
-      )
+      assertEmpty(client.workspaceMessageRequests)
       assert(bazelBspConfig.exists)
       server.assertBuildServerConnection()
     }
@@ -197,8 +193,7 @@ class BazelLspSuite
       assertNoDiff(
         client.workspaceMessageRequests,
         List(
-          bazelNavigationMessage,
-          Messages.ResetWorkspace.message,
+          Messages.ResetWorkspace.message
         ).mkString("\n"),
       )
       assert(bazelBspConfig.exists)
@@ -206,26 +201,15 @@ class BazelLspSuite
     }
   }
 
-  // TODO: Unignore this test
-  test("references".flaky) {
+  test("references") {
     cleanWorkspace()
     for {
       _ <- initialize(
         BazelBuildLayout(workspaceLayout, V.bazelScalaVersion, bazelVersion)
       )
       _ <- server.didOpen("Hello.scala")
-      references <- server.references("Hello.scala", "hello")
-      _ = assertNoDiff(
-        references,
-        """|Hello.scala:4:7: info: reference
-           |  def hello: String = "Hello"
-           |      ^^^^^
-           |Bar.scala:5:24: info: reference
-           |  def hi = new Hello().hello
-           |                       ^^^^^
-           |""".stripMargin,
-      )
       _ <- server.didOpen("Main.scala")
+      _ <- server.didSave("Main.scala")(identity)
       references <- server.references("Hello.scala", "hello")
       _ = assertNoDiff(
         references,
@@ -341,7 +325,60 @@ class BazelLspSuite
            |                   ^
            |""".stripMargin,
       )
-      _ = assertContains(jsonFile, "3.2.0-20240515-5f8e0ae-NIGHTLY")
+      _ = assertContains(jsonFile, BazelBuildTool.version)
+    } yield ()
+  }
+
+  test("update-projectview") {
+    cleanWorkspace()
+    writeLayout(
+      BazelBuildLayout(workspaceLayout, V.bazelScalaVersion, bazelVersion)
+    )
+
+    val projectview = workspace.resolve("projectview.bazelproject")
+    projectview.touch()
+
+    for {
+      _ <- initialize(
+        BazelBuildLayout(workspaceLayout, V.bazelScalaVersion, bazelVersion)
+      )
+      _ = { client.importBuildChanges = ImportBuildChanges.yes }
+      _ <- server.didOpen("Hello.scala")
+      _ = assertNoDiff(
+        projectview.readText,
+        BazelBuildTool.fallbackProjectView,
+      )
+      _ <- server.didChange("Hello.scala") { text =>
+        text.replace("def hello: String", "def hello: Int")
+      }
+      _ <- server.didSave("Hello.scala")(identity)
+      _ = assertNoDiff(
+        client.workspaceDiagnostics,
+        """|Hello.scala:4:20: error: type mismatch;
+           | found   : String("Hello")
+           | required: Int
+           |  def hello: Int = "Hello"
+           |                   ^
+           |  def hello: Int = "Hello"
+           |                   ^
+           |""".stripMargin,
+      )
+      _ = client.messageRequests.clear()
+      _ <- server.didOpen("Hello.scala")
+      _ <- server.didSave("Hello.scala") { text =>
+        text.replace("def hello: Int", "def hello: String")
+      }
+      _ = assertNoDiagnostics()
+      _ <- server.didOpen("projectview.bazelproject")
+      _ <- server.didSave("projectview.bazelproject")(_ => "")
+      _ = assertNoDiff(
+        client.workspaceMessageRequests,
+        ImportBuildChanges.params("bazel").getMessage(),
+      )
+      _ = assertNoDiff(
+        projectview.readText,
+        BazelBuildTool.fallbackProjectView,
+      )
     } yield ()
   }
 

@@ -15,6 +15,7 @@ import scala.concurrent.Future
 import scala.concurrent.Promise
 import scala.util.control.NonFatal
 
+import scala.meta.Dialect
 import scala.meta.dialects._
 import scala.meta.inputs.Input
 import scala.meta.internal.bsp.BspSession
@@ -78,6 +79,7 @@ final case class Indexer(
     workspaceFolder: AbsolutePath,
     implementationProvider: ImplementationProvider,
     resetService: () => Unit,
+    sharedIndices: SqlSharedIndices,
 )(implicit rc: ReportContext) {
 
   private implicit def ec: ExecutionContextExecutorService = executionContext
@@ -92,8 +94,11 @@ final case class Indexer(
     def reloadAndIndex(session: BspSession): Future[BuildChange] = {
       workspaceReload().persistChecksumStatus(Status.Started, buildTool)
 
+      buildTool.ensurePrerequisites(workspaceFolder)
       buildTool match {
         case _: BspOnly =>
+          reconnectToBuildServer()
+        case _ if !session.canReloadWorkspace =>
           reconnectToBuildServer()
         case _ =>
           session
@@ -174,6 +179,7 @@ final case class Indexer(
           List(
             ("definition index", definitionIndex),
             ("references index", referencesProvider().index),
+            ("identifier index", referencesProvider().identifierIndex.index),
             ("workspace symbol index", workspaceSymbols().inWorkspace),
             ("build targets", buildTargets),
             (
@@ -493,7 +499,18 @@ final case class Indexer(
       case Right(zip) =>
         scribe.debug(s"Indexing JDK sources from $zip")
         usedJars += zip
-        definitionIndex.addJDKSources(zip)
+        val dialect = ScalaVersions.dialectForDependencyJar(zip.filename)
+        sharedIndices.jvmTypeHierarchy.getTypeHierarchy(zip) match {
+          case Some(overrides) =>
+            definitionIndex.addIndexedSourceJar(zip, Nil, dialect)
+            implementationProvider.addTypeHierarchyElements(overrides)
+          case None =>
+            val (_, overrides) = indexJar(zip, dialect)
+            sharedIndices.jvmTypeHierarchy.addTypeHierarchyInfo(
+              zip,
+              overrides,
+            )
+        }
       case Left(notFound) =>
         val candidates = notFound.candidates.mkString(", ")
         scribe.warn(
@@ -503,9 +520,9 @@ final case class Indexer(
     for {
       item <- dependencySources.getItems.asScala
     } {
-      jdkSources.foreach(source =>
+      jdkSources.foreach { source =>
         data.addDependencySource(source, item.getTarget)
-      )
+      }
     }
     usedJars.toSet
   }
@@ -544,40 +561,50 @@ final case class Indexer(
         val input = sourceToIndex0.toInput
         val symbols = ArrayBuffer.empty[WorkspaceSymbolInformation]
         val methodSymbols = ArrayBuffer.empty[WorkspaceSymbolInformation]
-        SemanticdbDefinition.foreach(input, dialect, includeMembers = true) {
-          case SemanticdbDefinition(info, occ, owner) =>
-            if (info.isExtension) {
+        val optMtags = SemanticdbDefinition.foreachWithReturnMtags(
+          input,
+          dialect,
+          includeMembers = true,
+          collectIdentifiers = true,
+        ) { case SemanticdbDefinition(info, occ, owner) =>
+          if (info.isExtension) {
+            occ.range.foreach { range =>
+              methodSymbols += WorkspaceSymbolInformation(
+                info.symbol,
+                info.kind,
+                range.toLsp,
+              )
+            }
+          } else {
+            if (info.kind.isRelevantKind) {
               occ.range.foreach { range =>
-                methodSymbols += WorkspaceSymbolInformation(
+                symbols += WorkspaceSymbolInformation(
                   info.symbol,
                   info.kind,
                   range.toLsp,
                 )
               }
-            } else {
-              if (info.kind.isRelevantKind) {
-                occ.range.foreach { range =>
-                  symbols += WorkspaceSymbolInformation(
-                    info.symbol,
-                    info.kind,
-                    range.toLsp,
-                  )
-                }
-              }
             }
-            if (
-              sourceItem.isDefined &&
-              !info.symbol.isPackage &&
-              (owner.isPackage || source.isAmmoniteScript)
-            ) {
-              definitionIndex.addToplevelSymbol(
-                reluri,
-                source,
-                info.symbol,
-                dialect,
-              )
-            }
+          }
+          if (
+            sourceItem.isDefined &&
+            !info.symbol.isPackage &&
+            (owner.isPackage || source.isAmmoniteScript)
+          ) {
+            definitionIndex.addToplevelSymbol(
+              reluri,
+              source,
+              info.symbol,
+              dialect,
+            )
+          }
         }
+        optMtags
+          .map(_.allIdentifiers)
+          .filter(_.nonEmpty)
+          .foreach(identifiers =>
+            referencesProvider().addIdentifiers(source, identifiers)
+          )
         workspaceSymbols().didChange(source, symbols.toSeq, methodSymbols.toSeq)
 
         // Since the `symbols` here are toplevel symbols,
@@ -598,22 +625,6 @@ final case class Indexer(
    */
   private def addSourceJarSymbols(path: AbsolutePath): Unit = {
     val dialect = ScalaVersions.dialectForDependencyJar(path.filename)
-    def indexJar() = {
-      val indexResult = definitionIndex.addSourceJar(path, dialect)
-      val toplevels = indexResult.flatMap {
-        case IndexingResult(path, toplevels, _) =>
-          toplevels.map((_, path))
-      }
-      val overrides = indexResult.flatMap {
-        case IndexingResult(path, _, list) =>
-          list.flatMap { case (symbol, overridden) =>
-            overridden.map((path, symbol, _))
-          }
-      }
-      implementationProvider.addTypeHierarchyElements(overrides)
-      (toplevels, overrides)
-    }
-
     tables.jarSymbols.getTopLevels(path) match {
       case Some(toplevels) =>
         tables.jarSymbols.getTypeHierarchy(path) match {
@@ -621,13 +632,28 @@ final case class Indexer(
             definitionIndex.addIndexedSourceJar(path, toplevels, dialect)
             implementationProvider.addTypeHierarchyElements(overrides)
           case None =>
-            val (_, overrides) = indexJar()
+            val (_, overrides) = indexJar(path, dialect)
             tables.jarSymbols.addTypeHierarchyInfo(path, overrides)
         }
       case None =>
-        val (toplevels, overrides) = indexJar()
+        val (toplevels, overrides) = indexJar(path, dialect)
         tables.jarSymbols.putJarIndexingInfo(path, toplevels, overrides)
     }
+  }
+
+  private def indexJar(path: AbsolutePath, dialect: Dialect) = {
+    val indexResult = definitionIndex.addSourceJar(path, dialect)
+    val toplevels = indexResult.flatMap {
+      case IndexingResult(path, toplevels, _) =>
+        toplevels.map((_, path))
+    }
+    val overrides = indexResult.flatMap { case IndexingResult(path, _, list) =>
+      list.flatMap { case (symbol, overridden) =>
+        overridden.map((path, symbol, _))
+      }
+    }
+    implementationProvider.addTypeHierarchyElements(overrides)
+    (toplevels, overrides)
   }
 
   def reindexWorkspaceSources(

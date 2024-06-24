@@ -162,7 +162,13 @@ class CompilerConfiguration(
     protected def newCompiler(classpath: Seq[Path]): PresentationCompiler = {
       val name = scalaTarget.scalac.getTarget().getUri
       val options = enrichWithReleaseOption(scalaTarget)
-      fromMtags(mtags, options, classpath ++ additionalClasspath, name, search)
+      fromMtags(
+        mtags,
+        options,
+        classpath ++ additionalClasspath,
+        name,
+        search,
+      )
         .withBuildTargetName(scalaTarget.displayName)
     }
 
@@ -253,7 +259,7 @@ class CompilerConfiguration(
     val pc = mtags match {
       case MtagsBinaries.BuildIn => new ScalaPresentationCompiler()
       case artifacts: MtagsBinaries.Artifacts =>
-        embedded.presentationCompiler(artifacts, classpathSeq)
+        embedded.presentationCompiler(artifacts)
     }
 
     val filteredOptions = plugins.filterSupportedOptions(options)
@@ -355,7 +361,7 @@ class CompilerConfiguration(
         case Some(version) =>
           /* Filter out -target: and -Xtarget: options, since they are not relevant and
            * might interfere with -release option */
-          val filterOutTarget = scalacOptions.filter(opt =>
+          val filterOutTarget = scalacOptions.filterNot(opt =>
             opt.startsWith("-target:") || opt.startsWith("-Xtarget:")
           )
           filterOutTarget ++ List("-release", version.toString())

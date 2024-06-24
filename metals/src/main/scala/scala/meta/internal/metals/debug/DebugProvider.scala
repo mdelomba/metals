@@ -21,7 +21,6 @@ import scala.util.control.NonFatal
 import scala.meta.internal.metals.BuildServerConnection
 import scala.meta.internal.metals.BuildTargets
 import scala.meta.internal.metals.Cancelable
-import scala.meta.internal.metals.ClientCommands
 import scala.meta.internal.metals.ClientConfiguration
 import scala.meta.internal.metals.Compilations
 import scala.meta.internal.metals.Compilers
@@ -31,6 +30,7 @@ import scala.meta.internal.metals.DebugUnresolvedMainClassParams
 import scala.meta.internal.metals.DebugUnresolvedTestClassParams
 import scala.meta.internal.metals.JavaBinary
 import scala.meta.internal.metals.JsonParser._
+import scala.meta.internal.metals.JvmOpts
 import scala.meta.internal.metals.Messages
 import scala.meta.internal.metals.Messages.UnresolvedDebugSessionParams
 import scala.meta.internal.metals.MetalsBuildClient
@@ -38,6 +38,7 @@ import scala.meta.internal.metals.MetalsEnrichments._
 import scala.meta.internal.metals.MutableCancelable
 import scala.meta.internal.metals.ScalaTestSuites
 import scala.meta.internal.metals.ScalaTestSuitesDebugRequest
+import scala.meta.internal.metals.ServerCommands
 import scala.meta.internal.metals.SourceMapper
 import scala.meta.internal.metals.StacktraceAnalyzer
 import scala.meta.internal.metals.StatusBar
@@ -258,8 +259,10 @@ class DebugProvider(
             socket
           }
 
+        val startupTimeout = clientConfig.initialConfig.debugServerStartTimeout
+
         conn
-          .withTimeout(60, TimeUnit.SECONDS)
+          .withTimeout(startupTimeout, TimeUnit.SECONDS)
           .recover { case exception =>
             connectedToServer.tryFailure(exception)
             cancelPromise.trySuccess(())
@@ -716,11 +719,16 @@ class DebugProvider(
         val env = Option(params.env).toList.flatMap(createEnvList)
 
         envFromFile(Option(params.envFile)).map { envFromFile =>
+          val jvmOpts =
+            JvmOpts.fromWorkspaceOrEnvForTest(workspace).getOrElse(Nil)
           val scalaTestSuite = new b.ScalaTestSuites(
             List(
               new b.ScalaTestSuiteSelection(params.testClass, Nil.asJava)
             ).asJava,
-            Option(params.jvmOptions).getOrElse(Nil.asJava),
+            Option(params.jvmOptions)
+              .map(jvmOpts ++ _.asScala)
+              .getOrElse(jvmOpts)
+              .asJava,
             (envFromFile ::: env).asJava,
           )
           val debugParams = new b.DebugSessionParams(
@@ -757,17 +765,20 @@ class DebugProvider(
       request: ScalaTestSuitesDebugRequest,
   )(implicit ec: ExecutionContext): Future[DebugSessionParams] = {
     def makeDebugSession() = {
+      val jvmOpts = JvmOpts.fromWorkspaceOrEnvForTest(workspace).getOrElse(Nil)
       val debugSession =
         if (supportsTestSelection(request.target)) {
           val testSuites =
-            request.requestData.copy(suites = request.requestData.suites.map {
-              suite =>
+            request.requestData.copy(
+              suites = request.requestData.suites.map { suite =>
                 testProvider.getFramework(buildTarget, suite) match {
                   case JUnit4 | MUnit =>
                     suite.copy(tests = suite.tests.map(escapeTestName))
                   case _ => suite
                 }
-            })
+              },
+              jvmOptions = jvmOpts.asJava,
+            )
           val params = new b.DebugSessionParams(
             singletonList(buildTarget.getId)
           )
@@ -803,7 +814,7 @@ class DebugProvider(
         MetalsStatusParams(
           text = s"${clientConfig.icons.alert}Build misconfiguration",
           tooltip = e.getMessage(),
-          command = ClientCommands.RunDoctor.id,
+          command = ServerCommands.RunDoctor.id,
         )
       )
     case _ =>

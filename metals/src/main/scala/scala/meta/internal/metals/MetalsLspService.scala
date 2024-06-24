@@ -56,7 +56,6 @@ import scala.meta.internal.parsing.ClassFinder
 import scala.meta.internal.parsing.ClassFinderGranularity
 import scala.meta.internal.parsing.DocumentSymbolProvider
 import scala.meta.internal.parsing.FoldingRangeProvider
-import scala.meta.internal.parsing.TokenEditDistance
 import scala.meta.internal.parsing.Trees
 import scala.meta.internal.rename.RenameProvider
 import scala.meta.internal.search.SymbolHierarchyOps
@@ -170,14 +169,7 @@ abstract class MetalsLspService(
     ReportLevel.fromString(MetalsServerConfig.default.loglevel),
   )
 
-  val folderReportsZippper: FolderReportsZippper =
-    FolderReportsZippper(doctor, reports)
-
   def javaHome = userConfig.javaHome
-  protected val optJavaHome: Option[AbsolutePath] =
-    JdkSources.defaultJavaHome(javaHome).headOption
-  protected val maybeJdkVersion: Option[JdkVersion] =
-    JdkVersion.maybeJdkVersionFromJavaHome(optJavaHome)
 
   protected val fingerprints = new MutableMd5Fingerprints
   protected val mtags = new Mtags
@@ -360,15 +352,6 @@ abstract class MetalsLspService(
     )
   }
 
-  protected val referencesProvider: ReferenceProvider = new ReferenceProvider(
-    folder,
-    semanticdbs,
-    buffers,
-    definitionProvider,
-    trees,
-    buildTargets,
-  )
-
   protected val formattingProvider: FormattingProvider = new FormattingProvider(
     folder,
     buffers,
@@ -388,35 +371,14 @@ abstract class MetalsLspService(
       semanticdbs,
     )
 
-  protected val packageProvider: PackageProvider =
-    new PackageProvider(
-      buildTargets,
-      trees,
-      referencesProvider,
-      buffers,
-      definitionProvider,
-    )
-
-  protected val newFileProvider: NewFileProvider = new NewFileProvider(
-    languageClient,
-    packageProvider,
-    scalaVersionSelector,
-    clientConfig.icons,
-    onCreate = path => {
-      onCreate(path)
-      onChange(List(path))
-    },
-  )
-
   protected def onCreate(path: AbsolutePath): Unit = {
     buildTargets.onCreate(path)
     compilers.didChange(path)
   }
 
   protected val interactiveSemanticdbs: InteractiveSemanticdbs = {
-    val javaInteractiveSemanticdb = maybeJdkVersion.map(jdkVersion =>
-      JavaInteractiveSemanticdb.create(folder, buildTargets, jdkVersion)
-    )
+    val javaInteractiveSemanticdb =
+      JavaInteractiveSemanticdb.create(folder, buildTargets)
     register(
       new InteractiveSemanticdbs(
         folder,
@@ -424,7 +386,6 @@ abstract class MetalsLspService(
         charset,
         tables,
         () => compilers,
-        clientConfig,
         () => semanticDBIndexer,
         javaInteractiveSemanticdb,
         buffers,
@@ -485,6 +446,37 @@ abstract class MetalsLspService(
       sourceMapper,
       worksheetProvider,
     )
+  )
+
+  protected val referencesProvider: ReferenceProvider = new ReferenceProvider(
+    folder,
+    semanticdbs,
+    buffers,
+    definitionProvider,
+    trees,
+    buildTargets,
+    compilers,
+    scalaVersionSelector,
+  )
+
+  protected val packageProvider: PackageProvider =
+    new PackageProvider(
+      buildTargets,
+      trees,
+      referencesProvider,
+      buffers,
+      definitionProvider,
+    )
+
+  protected val newFileProvider: NewFileProvider = new NewFileProvider(
+    languageClient,
+    packageProvider,
+    scalaVersionSelector,
+    clientConfig.icons,
+    onCreate = path => {
+      onCreate(path)
+      onChange(List(path))
+    },
   )
 
   protected val javaFormattingProvider: JavaFormattingProvider =
@@ -872,6 +864,7 @@ abstract class MetalsLspService(
         buffers.put(path, change.getText)
         diagnostics.didChange(path)
         compilers.didChange(path)
+        referencesProvider.didChange(path, change.getText)
         parseTrees(path).asJava
     }
   }
@@ -891,7 +884,8 @@ abstract class MetalsLspService(
     val path = params.getTextDocument.getUri.toAbsolutePath
     savedFiles.add(path)
     // read file from disk, we only remove files from buffers on didClose.
-    buffers.put(path, path.toInput.text)
+    val text = path.toInput.text
+    buffers.put(path, text)
     Future
       .sequence(
         List(
@@ -1111,80 +1105,42 @@ abstract class MetalsLspService(
   override def references(
       params: ReferenceParams
   ): CompletableFuture[util.List[Location]] =
-    CancelTokens { _ => referencesResult(params).flatMap(_.locations).asJava }
-
-  // Triggers a cascade compilation and tries to find new references to a given symbol.
-  // It's not possible to stream reference results so if we find new symbols we notify the
-  // user to run references again to see updated results.
-  protected def compileAndLookForNewReferences(
-      params: ReferenceParams,
-      result: List[ReferencesResult],
-  ): Unit = {
-    val path = params.getTextDocument.getUri.toAbsolutePath
-    val old = path.toInputFromBuffers(buffers)
-    compilations.cascadeCompileFiles(Seq(path)).foreach { _ =>
-      val newBuffer = path.toInputFromBuffers(buffers)
-      val newParams: Option[ReferenceParams] =
-        if (newBuffer.text == old.text) Some(params)
-        else {
-          val edit = TokenEditDistance(old, newBuffer, trees)
-          edit
-            .getOrElse(TokenEditDistance.NoMatch)
-            .toRevised(
-              params.getPosition.getLine,
-              params.getPosition.getCharacter,
-            )
-            .foldResult(
-              pos => {
-                params.getPosition.setLine(pos.startLine)
-                params.getPosition.setCharacter(pos.startColumn)
-                Some(params)
-              },
-              () => Some(params),
-              () => None,
-            )
-        }
-      newParams match {
-        case None =>
-        case Some(p) =>
-          val newResult = referencesProvider.references(p)
-          val diff = newResult
-            .flatMap(_.locations)
-            .length - result.flatMap(_.locations).length
-          val diffSyms: Set[String] =
-            newResult.map(_.symbol).toSet -- result.map(_.symbol).toSet
-          if (diffSyms.nonEmpty && diff > 0) {
-            import scala.meta.internal.semanticdb.Scala._
-            val names =
-              diffSyms.map(sym => s"'${sym.desc.name.value}'").mkString(" and ")
-            val message =
-              s"Found new symbol references for $names, try running again."
-            scribe.info(message)
-            statusBar
-              .addMessage(clientConfig.icons.info + message)
-          }
-      }
+    CancelTokens.future { _ =>
+      referencesResult(params).map(getSortedLocations)
     }
+
+  private def getSortedLocations(referencesResult: List[ReferencesResult]) =
+    referencesResult
+      .flatMap(_.locations)
+      .groupBy(_.getUri())
+      .flatMap { case (_, locs) =>
+        locs.sortWith(sortByLocationPosition).distinct
+      }
+      .toSeq
+      .asJava
+
+  private def sortByLocationPosition(l1: Location, l2: Location): Boolean = {
+    l1.getRange.getStart.getLine < l2.getRange.getStart.getLine
   }
 
-  def referencesResult(params: ReferenceParams): List[ReferencesResult] = {
+  def referencesResult(
+      params: ReferenceParams
+  ): Future[List[ReferencesResult]] = {
     val timer = new Timer(time)
-    val results: List[ReferencesResult] = referencesProvider.references(params)
-    if (clientConfig.initialConfig.statistics.isReferences) {
-      if (results.forall(_.symbol.isEmpty)) {
-        scribe.info(s"time: found 0 references in $timer")
-      } else {
-        scribe.info(
-          s"time: found ${results.flatMap(_.locations).length} references to symbol '${results
-              .map(_.symbol)
-              .mkString("and")}' in $timer"
-        )
+    referencesProvider.references(params).map { results =>
+      if (clientConfig.initialConfig.statistics.isReferences) {
+        if (results.forall(_.symbol.isEmpty)) {
+          scribe.info(s"time: found 0 references in $timer")
+        } else {
+          scribe.info(
+            s"time: found ${results.flatMap(_.locations).length} references to symbol '${results
+                .map(_.symbol)
+                .mkString("and")}' in $timer"
+          )
+        }
       }
+      results
     }
-    if (results.nonEmpty) {
-      compileAndLookForNewReferences(params, results)
-    }
-    results
   }
 
   override def semanticTokensFull(
@@ -1599,6 +1555,8 @@ abstract class MetalsLspService(
 
   def fileWatcher: FileWatcher
 
+  private val sharedIndices = new SqlSharedIndices
+
   protected val indexer: Indexer = Indexer(
     () => workspaceReload,
     check,
@@ -1633,6 +1591,7 @@ abstract class MetalsLspService(
     folder,
     implementationProvider,
     resetService,
+    sharedIndices,
   )
 
   def projectInfo: MetalsServiceInfo
@@ -1646,11 +1605,12 @@ abstract class MetalsLspService(
       tables,
       clientConfig,
       mtagsResolver,
-      () => userConfig.javaHome,
-      maybeJdkVersion,
       getVisibleName,
-      () => projectInfo,
+      projectInfo,
     )
+
+  val folderReportsZippper: FolderReportsZippper =
+    FolderReportsZippper(doctor, reports)
 
   protected def check(): Unit = {
     doctor.check(headDoctor)
@@ -1702,41 +1662,55 @@ abstract class MetalsLspService(
         occ <- positionOccurrence.occurrence
       } yield occ) match {
         case Some(occ) =>
-          if (occ.role.isDefinition && !definitionOnly) {
-            val refParams = new ReferenceParams(
-              positionParams.getTextDocument(),
-              positionParams.getPosition(),
-              new ReferenceContext(false),
-            )
-            val results = referencesResult(refParams)
-            if (results.flatMap(_.locations).isEmpty) {
-              // Fallback again to the original behavior that returns
-              // the definition location itself if no reference locations found,
-              // for avoiding the confusing messages like "No definition found ..."
-              definitionResult(positionParams, token)
-            } else {
-              Future.successful(
-                DefinitionResult(
-                  locations = results.flatMap(_.locations).asJava,
-                  symbol = results.head.symbol,
-                  definition = None,
-                  semanticdb = None,
-                  querySymbol = results.head.symbol,
-                )
-              )
-            }
-          } else {
-            definitionResult(positionParams, token)
-          }
+          if (occ.role.isDefinition && !definitionOnly)
+            getReferencesForGoToDefinition(positionParams, token)
+          else definitionResult(positionParams, token)
         case None =>
           // Even if it failed to retrieve the symbol occurrence from semanticdb,
           // try to find its definitions from presentation compiler.
-          definitionResult(positionParams, token)
+          definitionResult(positionParams, token).flatMap { definition =>
+            def isOnDefinition = definition.locations.asScala.exists(
+              _.getRange().encloses(positionParams.getPosition())
+            )
+            if (!definitionOnly && isOnDefinition)
+              getReferencesForGoToDefinition(positionParams, token)
+            else Future.successful(definition)
+          }
       }
     } else {
       // Ignore non-scala files.
       Future.successful(DefinitionResult.empty)
     }
+  }
+
+  private def getReferencesForGoToDefinition(
+      positionParams: TextDocumentPositionParams,
+      token: CancelToken,
+  ) = {
+    val refParams = new ReferenceParams(
+      positionParams.getTextDocument(),
+      positionParams.getPosition(),
+      new ReferenceContext(false),
+    )
+    referencesResult(refParams).flatMap { results =>
+      if (results.flatMap(_.locations).isEmpty) {
+        // Fallback again to the original behavior that returns
+        // the definition location itself if no reference locations found,
+        // for avoiding the confusing messages like "No definition found ..."
+        definitionResult(positionParams, token)
+      } else {
+        Future.successful(
+          DefinitionResult(
+            locations = getSortedLocations(results),
+            symbol = results.head.symbol,
+            definition = None,
+            semanticdb = None,
+            querySymbol = results.head.symbol,
+          )
+        )
+      }
+    }
+
   }
 
   /**

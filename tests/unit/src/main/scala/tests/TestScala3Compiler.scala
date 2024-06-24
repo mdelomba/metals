@@ -19,7 +19,7 @@ object TestScala3Compiler {
   def compiler(name: String, input: InputProperties)(implicit
       ec: ExecutionContext
   ): Option[PresentationCompiler] = {
-    val resolver = new TestMtagsResolver()
+    val resolver = new TestMtagsResolver(checkCoursier = true)
     resolver.resolve(V.scala3) match {
       case Some(mtags: MtagsBinaries.Artifacts) =>
         val time = new FakeTime
@@ -27,7 +27,7 @@ object TestScala3Compiler {
         val status = new WorkDoneProgress(client, time)(ec)
         val embedded = new Embedded(status)
         val pc = embedded
-          .presentationCompiler(mtags, mtags.jars)
+          .presentationCompiler(mtags)
           .newInstance(
             name,
             input.classpath.entries.map(_.toNIO).asJava,

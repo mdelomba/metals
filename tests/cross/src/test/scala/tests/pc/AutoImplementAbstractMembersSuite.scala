@@ -370,7 +370,26 @@ class AutoImplementAbstractMembersSuite extends BaseCodeActionSuite {
        |
        |  }
        |}
-       |""".stripMargin
+       |""".stripMargin,
+    compat = Map(
+      "3" ->
+        """|abstract class SuperAbstract {
+           |  def foo: Int
+           |}
+           |trait Bar extends SuperAbstract {
+           |  def bar: Int
+           |}
+           |object Main {
+           |  class Baz extends Bar {
+           |
+           |    override def bar: Int = ???
+           |
+           |    override def foo: Int = ???
+           |
+           |  }
+           |}
+           |""".stripMargin
+    )
   )
 
   checkEdit(
@@ -1268,6 +1287,35 @@ class AutoImplementAbstractMembersSuite extends BaseCodeActionSuite {
        |  end Concrete
        |
        |}
+       |""".stripMargin
+  )
+
+  checkEdit(
+    "braceless-case-class".tag(IgnoreScala2),
+    """|package a
+       |
+       |trait Base:
+       |  def foo(x: Int): Int
+       |  def bar(x: String): String
+       |
+       |case class <<Concrete>>() extends Base:
+       |  def aaa = "aaa"
+       |end Concrete
+       |""".stripMargin,
+    """|package a
+       |
+       |trait Base:
+       |  def foo(x: Int): Int
+       |  def bar(x: String): String
+       |
+       |case class Concrete() extends Base:
+       |
+       |  override def foo(x: Int): Int = ???
+       |
+       |  override def bar(x: String): String = ???
+       |
+       |  def aaa = "aaa"
+       |end Concrete
        |""".stripMargin
   )
 

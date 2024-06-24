@@ -654,6 +654,11 @@ object MetalsEnrichments
       }
     }
 
+    def deleteWithEmptyParents(): Unit = {
+      deleteIfExists()
+      deleteEmptyParents(path)
+    }
+
     def appendText(text: String): Unit = {
       path.parent.createDirectories()
       Files.write(
@@ -663,6 +668,16 @@ object MetalsEnrichments
       )
     }
 
+  }
+
+  @tailrec
+  private def deleteEmptyParents(current: AbsolutePath): Unit = {
+    current.parentOpt match {
+      case Some(parent) if parent.list.headOption.isEmpty =>
+        parent.deleteIfExists()
+        deleteEmptyParents(parent)
+      case _ =>
+    }
   }
 
   implicit class XtensionString(value: String) {
@@ -938,9 +953,13 @@ object MetalsEnrichments
         diag.getSeverity.toLsp,
         if (diag.getSource == null) "scalac" else diag.getSource,
       )
-      if (diag.getCode() != null) {
+      Option(diag.getCode()).foreach { code =>
         ld.setCode(diag.getCode())
+        if (DiagnosticCodes.isEqual(code, DiagnosticCodes.Unused)) {
+          ld.setTags(java.util.List.of(l.DiagnosticTag.Unnecessary))
+        }
       }
+
       ld.setData(diag.getData)
       ld
     }
@@ -1298,5 +1317,19 @@ object MetalsEnrichments
    */
   def filterANSIColorCodes(str: String): String =
     str.replaceAll("\u001b\\[1A\u001b\\[K|\u001B\\[[;\\d]*m", "")
+
+  def executeBatched[T](toExec: List[() => Future[T]], batchSize: Int)(implicit
+      ec: ExecutionContext
+  ): Future[List[T]] = {
+    toExec
+      .grouped(batchSize)
+      .foldLeft(Future.successful(List.empty[List[T]])) { case (accF, toExec) =>
+        for {
+          acc <- accF
+          curr <- Future.sequence(toExec.map(_()))
+        } yield curr :: acc
+      }
+      .map(_.reverse.flatten)
+  }
 
 }
